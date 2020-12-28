@@ -1,4 +1,4 @@
-# Copyright 2018 The Kubernetes Authors.
+# Copyright 2020 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,29 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
 SOURCES := $(shell find . -name '*.go')
 GOOS ?= $(shell go env GOOS)
-VERSION ?= $(shell git describe --exact-match 2> /dev/null || \
-                 git describe --match=$(git rev-parse --short=8 HEAD) --always --dirty --abbrev=8)
-LDFLAGS   := "-w -s -X 'main.version=${VERSION}'"
-
-IMAGE ?= gcr.io/k8s-staging-provider-aws/cloud-controller-manager:$(VERSION)
-
-export GO111MODULE=on
+GOPROXY ?= $(shell go env GOPROXY)
+GIT_VERSION := $(shell git describe --match=$(git rev-parse --short=8 HEAD) --always --dirty --abbrev=8)
+VERSION ?= $(GIT_VERSION)
+IMAGE := amazon/cloud-controller-manager:$(VERSION)
 
 aws-cloud-controller-manager: $(SOURCES)
-	 CGO_ENABLED=0 GOOS=$(GOOS) go build \
-		-ldflags $(LDFLAGS) \
-		-o aws-cloud-controller-manager \
+	 GO111MODULE=on CGO_ENABLED=0 GOOS=$(GOOS) GOPROXY=$(GOPROXY) go build \
+		-ldflags="-w -s -X 'main.version=$(VERSION)'" \
+		-o=aws-cloud-controller-manager \
 		cmd/aws-cloud-controller-manager/main.go
 
-.PHONY: build
-build:
-	docker build -t $(IMAGE) .
+ecr-credential-provider:  $(shell find ./cmd/ecr-credential-provider -name '*.go')
+	 GO111MODULE=on CGO_ENABLED=0 GOOS=$(GOOS) GOPROXY=$(GOPROXY) go build \
+		-ldflags="-w -s -X 'main.version=$(VERSION)'" \
+		-o=ecr-credential-provider \
+		cmd/ecr-credential-provider/*.go
 
-.PHONY: push
-push: build
-	docker push $(IMAGE)
+.PHONY: docker-build
+docker-build:
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg GOOS=$(GOOS) \
+		--build-arg GOPROXY=$(GOPROXY) \
+		--tag $(IMAGE) .
 
 .PHONY: check
 check: verify-fmt verify-lint vet
@@ -52,6 +56,10 @@ verify-lint:
 	which golint 2>&1 >/dev/null || go get golang.org/x/lint/golint
 	golint -set_exit_status $(shell go list ./...)
 
+.PHONY: verify-codegen
+verify-codegen:
+	./hack/verify-codegen.sh
+
 .PHONY: vet
 vet:
 	go vet ./...
@@ -59,3 +67,11 @@ vet:
 .PHONY: update-fmt
 update-fmt:
 	./hack/update-gofmt.sh
+
+.PHONY: docs
+docs:
+	./hack/build-gitbooks.sh
+
+.PHONY: publish-docs
+publish-docs:
+	./hack/publish-docs.sh

@@ -1,0 +1,14 @@
+images:
+  - 'gcr.io/$PROJECT_ID/cloud-controller-manager:$_GIT_TAG'
+  - 'gcr.io/$PROJECT_ID/cloud-controller-manager:latest'
+options:
+  substitution_option: ALLOW_LOOSE
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+    - build
+    - --tag=gcr.io/$PROJECT_ID/cloud-controller-manager:$_GIT_TAG
+    - --tag=gcr.io/$PROJECT_ID/cloud-controller-manager:latest
+    - --build-arg=VERSION=$_GIT_TAG
+    - .
+timeout: 1200s

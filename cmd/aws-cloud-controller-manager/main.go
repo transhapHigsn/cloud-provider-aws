@@ -39,23 +39,31 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/cloud-provider/app"
+	"k8s.io/cloud-provider/options"
+	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
 	_ "k8s.io/component-base/metrics/prometheus/clientgo" // for client metric registration
 	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
-	"k8s.io/klog"
-	"k8s.io/kubernetes/cmd/cloud-controller-manager/app"
-	"k8s.io/kubernetes/cmd/cloud-controller-manager/app/options"
-	"k8s.io/kubernetes/pkg/features" // add the kubernetes feature gates
-	utilflag "k8s.io/kubernetes/pkg/util/flag"
-	"k8s.io/legacy-cloud-providers/aws"
+	"k8s.io/component-base/term"
+	"k8s.io/component-base/version/verflag"
+	"k8s.io/klog/v2"
 	netutils "k8s.io/utils/net"
 
 	cloudprovider "k8s.io/cloud-provider"
-	cloudcontrollerconfig "k8s.io/kubernetes/cmd/cloud-controller-manager/app/config"
-	cloudcontrollers "k8s.io/kubernetes/pkg/controller/cloud"
-	routecontroller "k8s.io/kubernetes/pkg/controller/route"
-	servicecontroller "k8s.io/kubernetes/pkg/controller/service"
+	awsv1 "k8s.io/cloud-provider-aws/pkg/providers/v1"
+	awsv2 "k8s.io/cloud-provider-aws/pkg/providers/v2"
+
+	cloudcontrollerconfig "k8s.io/cloud-provider/app/config"
+	cloudnodecontroller "k8s.io/cloud-provider/controllers/node"
+	cloudnodelifecyclecontroller "k8s.io/cloud-provider/controllers/nodelifecycle"
+	routecontroller "k8s.io/cloud-provider/controllers/route"
+	servicecontroller "k8s.io/cloud-provider/controllers/service"
+)
+
+const (
+	enableAlphaV2EnvVar = "ENABLE_ALPHA_V2"
 )
 
 var version string
@@ -71,6 +79,7 @@ func main() {
 		klog.Fatalf("unable to initialize command options: %v", err)
 	}
 
+	var controllerInitializers map[string]app.InitFunc
 	command := &cobra.Command{
 		Use:  "aws-cloud-controller-manager",
 		Long: `aws-cloud-controller-manager manages AWS cloud resources for a Kubernetes cluster.`,
@@ -83,32 +92,93 @@ func main() {
 				os.Exit(0)
 			}
 
-			// Hard code aws cloud provider
+			// Default to the v1 provider if not set
 			cloudProviderFlag := cmd.Flags().Lookup("cloud-provider")
-			cloudProviderFlag.Value.Set(aws.ProviderName)
+			if cloudProviderFlag.Value.String() == "" {
+				cloudProviderFlag.Value.Set(awsv1.ProviderName)
+			}
 
-			utilflag.PrintFlags(cmd.Flags())
+			cloudProvider := cloudProviderFlag.Value.String()
+			if cloudProvider != awsv1.ProviderName && cloudProvider != awsv2.ProviderName {
+				klog.Fatalf("unknown cloud provider %s, only 'aws' and 'aws/v2' are supported", cloudProvider)
+			}
 
-			c, err := s.Config(KnownControllers(), ControllersDisabledByDefault.List())
+			if cloudProvider == awsv2.ProviderName {
+				if v2Enabled := os.Getenv(enableAlphaV2EnvVar); v2Enabled != "true" {
+					klog.Fatalf("aws/v2 cloud provider requires environment variable ENABLE_ALPHA_V2=true to be set")
+				}
+			}
+
+			cliflag.PrintFlags(cmd.Flags())
+
+			c, err := s.Config(KnownControllers(), app.ControllersDisabledByDefault.List())
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
 
-			if err := app.Run(c.Complete(), wait.NeverStop); err != nil {
+			cloudConfigFile := c.ComponentConfig.KubeCloudShared.CloudProvider.CloudConfigFile
+
+			// initialize cloud provider with the cloud provider name and config file provided
+			cloud, err := cloudprovider.InitCloudProvider(cloudProvider, cloudConfigFile)
+			if err != nil {
+				klog.Fatalf("Cloud provider could not be initialized: %v", err)
+			}
+			if cloud == nil {
+				klog.Fatalf("Cloud provider is nil")
+			}
+
+			if !cloud.HasClusterID() {
+				if c.ComponentConfig.KubeCloudShared.AllowUntaggedCloud {
+					klog.Warning("detected a cluster without a ClusterID.  A ClusterID will be required in the future.  Please tag your cluster to avoid any future issues")
+				} else {
+					klog.Fatalf("no ClusterID found.  A ClusterID is required for the cloud provider to function properly.  This check can be bypassed by setting the allow-untagged-cloud option")
+				}
+			}
+
+			// Initialize the cloud provider with a reference to the clientBuilder
+			cloud.Initialize(c.ClientBuilder, make(chan struct{}))
+			// Set the informer on the user cloud object
+			if informerUserCloud, ok := cloud.(cloudprovider.InformerUser); ok {
+				informerUserCloud.SetInformers(c.SharedInformers)
+			}
+
+			controllerInitializers = app.DefaultControllerInitializers(c.Complete(), cloud)
+
+			if err := app.Run(c.Complete(), controllerInitializers, wait.NeverStop); err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
 		},
+		Args: func(cmd *cobra.Command, args []string) error {
+			for _, arg := range args {
+				if len(arg) > 0 {
+					return fmt.Errorf("%q does not take any arguments, got %q", cmd.CommandPath(), args)
+				}
+			}
+			return nil
+		},
 	}
 
 	fs := command.Flags()
-	namedFlagSets := s.Flags(KnownControllers(), ControllersDisabledByDefault.List())
+	namedFlagSets := s.Flags(app.KnownControllers(controllerInitializers), app.ControllersDisabledByDefault.List())
+	verflag.AddFlags(namedFlagSets.FlagSet("global"))
 	globalflag.AddGlobalFlags(namedFlagSets.FlagSet("global"), command.Name())
 
 	for _, f := range namedFlagSets.FlagSets {
 		fs.AddFlagSet(f)
 	}
+	usageFmt := "Usage:\n  %s\n"
+	cols, _, _ := term.TerminalSize(command.OutOrStdout())
+	command.SetUsageFunc(func(cmd *cobra.Command) error {
+		fmt.Fprintf(cmd.OutOrStderr(), usageFmt, cmd.UseLine())
+		cliflag.PrintSections(cmd.OutOrStderr(), namedFlagSets, cols)
+		return nil
+	})
+	command.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s\n\n"+usageFmt, cmd.Long, cmd.UseLine())
+		cliflag.PrintSections(cmd.OutOrStdout(), namedFlagSets, cols)
+	})
 
 	if err := command.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -127,9 +197,6 @@ func KnownControllers() []string {
 	return ret.List()
 }
 
-// ControllersDisabledByDefault is the controller disabled default when starting cloud-controller managers.
-var ControllersDisabledByDefault = sets.NewString()
-
 // newControllerInitializers is a private map of named controller groups (you can start more than one in an init func)
 // paired to their initFunc.  This allows for structured downstream composition and subdivision.
 func newControllerInitializers() map[string]initFunc {
@@ -143,7 +210,7 @@ func newControllerInitializers() map[string]initFunc {
 
 func startCloudNodeController(ctx *cloudcontrollerconfig.CompletedConfig, cloud cloudprovider.Interface, stopCh <-chan struct{}) (http.Handler, bool, error) {
 	// Start the CloudNodeController
-	nodeController, err := cloudcontrollers.NewCloudNodeController(
+	nodeController, err := cloudnodecontroller.NewCloudNodeController(
 		ctx.SharedInformers.Core().V1().Nodes(),
 		// cloud node controller uses existing cluster role from node-controller
 		ctx.ClientBuilder.ClientOrDie("node-controller"),
@@ -162,7 +229,7 @@ func startCloudNodeController(ctx *cloudcontrollerconfig.CompletedConfig, cloud 
 
 func startCloudNodeLifecycleController(ctx *cloudcontrollerconfig.CompletedConfig, cloud cloudprovider.Interface, stopCh <-chan struct{}) (http.Handler, bool, error) {
 	// Start the cloudNodeLifecycleController
-	cloudNodeLifecycleController, err := cloudcontrollers.NewCloudNodeLifecycleController(
+	cloudNodeLifecycleController, err := cloudnodelifecyclecontroller.NewCloudNodeLifecycleController(
 		ctx.SharedInformers.Core().V1().Nodes(),
 		// cloud node lifecycle controller uses existing cluster role from node-controller
 		ctx.ClientBuilder.ClientOrDie("node-controller"),
@@ -187,6 +254,7 @@ func startServiceController(ctx *cloudcontrollerconfig.CompletedConfig, cloud cl
 		ctx.SharedInformers.Core().V1().Services(),
 		ctx.SharedInformers.Core().V1().Nodes(),
 		ctx.ComponentConfig.KubeCloudShared.ClusterName,
+		utilfeature.DefaultFeatureGate,
 	)
 	if err != nil {
 		// This error shouldn't fail. It lives like this as a legacy.
@@ -219,7 +287,7 @@ func startRouteController(ctx *cloudcontrollerconfig.CompletedConfig, cloud clou
 	}
 
 	// failure: more than one cidr and dual stack is not enabled
-	if len(clusterCIDRs) > 1 && !utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) {
+	if len(clusterCIDRs) > 1 && !utilfeature.DefaultFeatureGate.Enabled(app.IPv6DualStack) {
 		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and dualstack feature is not enabled", len(clusterCIDRs))
 	}
 
